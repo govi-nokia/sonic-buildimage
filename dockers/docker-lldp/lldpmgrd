@@ -34,6 +34,112 @@ PORT_INIT_TIMEOUT = 300
 FAILED_CMD_TIMEOUT = 6
 RETRY_LIMIT = 5
 
+CFG_LLDP_TABLE_NAME = "LLDP"
+CFG_LLDP_GLOBAL_KEY = "GLOBAL"
+CFG_LLDP_PORT_TABLE_NAME = "LLDP_PORT"
+CFG_LLDP_CUSTOM_TLV_TABLE_NAME = "LLDP_CUSTOM_TLV"
+
+LLDP_GLOBAL_DEFAULTS = {
+    "enabled": "true",
+    "hello_time": "30",
+    "multiplier": "4",
+    "supp_mgmt_address_tlv": "false",
+    "supp_system_capabilities_tlv": "false",
+}
+
+
+def resolve_lldp_status(enabled, mode=None):
+    if enabled == "false":
+        return "disabled"
+    if mode == "TRANSMIT":
+        return "tx-only"
+    if mode == "RECEIVE":
+        return "rx-only"
+    return "rx-and-tx"
+
+
+def build_global_lldp_cli_commands(cfg):
+    """
+    Build lldpcli command argument lists for LLDP|GLOBAL configuration.
+    cfg contains only fields present in CONFIG_DB; defaults fill the rest.
+    """
+    merged = {**LLDP_GLOBAL_DEFAULTS, **cfg}
+    commands = []
+
+    commands.append(["lldpcli", "configure", "lldp", "tx-interval", merged["hello_time"]])
+    commands.append(["lldpcli", "configure", "lldp", "tx-hold", merged["multiplier"]])
+
+    status = resolve_lldp_status(merged["enabled"], merged.get("mode"))
+    commands.append(["lldpcli", "configure", "lldp", "status", status])
+
+    if "system_name" in cfg:
+        commands.append(["lldpcli", "configure", "system", "hostname", cfg["system_name"]])
+    if "system_description" in cfg:
+        commands.append(["lldpcli", "configure", "system", "description", cfg["system_description"]])
+
+    if merged["supp_mgmt_address_tlv"] == "true":
+        commands.append(["lldpcli", "unconfigure", "lldp", "management-addresses-advertisements"])
+    else:
+        commands.append(["lldpcli", "configure", "lldp", "management-addresses-advertisements"])
+
+    if merged["supp_system_capabilities_tlv"] == "true":
+        commands.append(["lldpcli", "unconfigure", "lldp", "capabilities-advertisements"])
+    else:
+        commands.append(["lldpcli", "configure", "lldp", "capabilities-advertisements"])
+
+    return commands
+
+
+def hex_bytes_for_lldpcli(value):
+    """Turn hex with optional :,-,space separators into lldpcli comma-hex."""
+    if not value:
+        return None
+    cleaned = "".join(ch for ch in value if ch not in ":,- \t")
+    if len(cleaned) < 2 or len(cleaned) % 2:
+        return None
+    try:
+        bytes.fromhex(cleaned)
+    except ValueError:
+        return None
+    return ",".join(cleaned[i:i + 2] for i in range(0, len(cleaned), 2))
+
+
+def build_custom_tlv_cli_commands(entries):
+    """Rebuild advertised custom TLVs. entries is a list of field maps."""
+    commands = [["lldpcli", "unconfigure", "lldp", "custom-tlv"]]
+    for fields in entries:
+        oui = hex_bytes_for_lldpcli(fields.get("oui", ""))
+        subtype = fields.get("oui_subtype", fields.get("subtype", ""))
+        if not oui or subtype == "":
+            continue
+        cmd = [
+            "lldpcli", "configure", "lldp", "custom-tlv", "add",
+            "oui", oui, "subtype", str(subtype),
+        ]
+        info = hex_bytes_for_lldpcli(fields.get("value", ""))
+        if info:
+            cmd.extend(["oui-info", info])
+        commands.append(cmd)
+    return commands
+
+
+def is_lldp_skipped_port(port_name):
+    return any([
+        port_name.startswith(inband_prefix()),
+        port_name.startswith(recirc_prefix()),
+        port_name.startswith(backplane_prefix()),
+    ])
+
+
+def build_port_lldp_status_command(port_name, cfg):
+    """
+    Build lldpcli command to set per-port LLDP status from LLDP_PORT config.
+    cfg may be a port row or global defaults when reverting a deleted port row.
+    """
+    merged = {**LLDP_GLOBAL_DEFAULTS, **cfg}
+    status = resolve_lldp_status(merged["enabled"], merged.get("mode"))
+    return ["lldpcli", "configure", "ports", port_name, "lldp", "status", status]
+
 
 class LldpManager(daemon_base.DaemonBase):
     """
@@ -70,10 +176,14 @@ class LldpManager(daemon_base.DaemonBase):
         self.pending_cmds = {}
         self.hostname = None
         self.mgmt_ip = "None"
+        self.lldp_global_cfg = {}
 
         self.device_table = swsscommon.Table(self.config_db, swsscommon.CFG_DEVICE_METADATA_TABLE_NAME)
         self.port_table = swsscommon.Table(self.config_db, swsscommon.CFG_PORT_TABLE_NAME)
         self.mgmt_table = swsscommon.Table(self.config_db, swsscommon.CFG_MGMT_INTERFACE_TABLE_NAME)
+        self.lldp_global_table = swsscommon.Table(self.config_db, CFG_LLDP_TABLE_NAME)
+        self.lldp_port_table = swsscommon.Table(self.config_db, CFG_LLDP_PORT_TABLE_NAME)
+        self.lldp_custom_tlv_table = swsscommon.Table(self.config_db, CFG_LLDP_CUSTOM_TLV_TABLE_NAME)
         self.app_port_table = swsscommon.Table(self.appl_db, swsscommon.APP_PORT_TABLE_NAME)
         self.state_port_table = swsscommon.Table(self.state_db, swsscommon.STATE_PORT_TABLE_NAME)
 
@@ -95,6 +205,9 @@ class LldpManager(daemon_base.DaemonBase):
         else:
             self.hostname = hostname
 
+    def configured_management_interface(self):
+        return (self.lldp_global_cfg or {}).get("management_interface") or ""
+
     def update_mgmt_addr(self, ip):
         if ip == "None":
             cmd = ["lldpcli", "unconfigure", "system", "ip", "management", "pattern"]
@@ -112,6 +225,76 @@ class LldpManager(daemon_base.DaemonBase):
             self.log_warning("Command failed '{}': {}".format(cmd, stderr))
         else:
             self.mgmt_ip = ip
+
+    def apply_management_pattern(self):
+        """Honor LLDP|GLOBAL management_interface, else first MGMT_INTERFACE IP."""
+        iface = self.configured_management_interface()
+        if iface:
+            if iface != self.mgmt_ip:
+                self.update_mgmt_addr(iface)
+            return
+        ip_addr = self.lldp_get_mgmt_ip()
+        if ip_addr != self.mgmt_ip:
+            self.update_mgmt_addr(ip_addr)
+
+    def apply_custom_tlv_config(self):
+        entries = []
+        for name in self.lldp_custom_tlv_table.getKeys():
+            _, fvp = self.lldp_custom_tlv_table.get(name)
+            if fvp:
+                entries.append(dict(fvp))
+        for cmd in build_custom_tlv_cli_commands(entries):
+            self.log_debug("Running command: '{}'".format(cmd))
+            rc, stderr = run_cmd(self, cmd)
+            if rc != 0:
+                self.log_warning("Command failed '{}': {}".format(cmd, stderr))
+
+    def apply_global_lldp_config(self, cfg):
+        """
+        Apply LLDP|GLOBAL settings to lldpd via lldpcli.
+        cfg is the CONFIG_DB field-value map; absent row uses defaults only.
+        """
+        self.lldp_global_cfg = dict(cfg)
+        for cmd in build_global_lldp_cli_commands(cfg):
+            self.log_debug("Running command: '{}'".format(cmd))
+            rc, stderr = run_cmd(self, cmd)
+            if rc != 0:
+                self.log_warning("Command failed '{}': {}".format(cmd, stderr))
+        self.apply_management_pattern()
+
+    def apply_port_lldp_status(self, port_name, cfg):
+        if is_lldp_skipped_port(port_name):
+            return
+        cmd = build_port_lldp_status_command(port_name, cfg)
+        self.log_debug("Running command: '{}'".format(cmd))
+        rc, stderr = run_cmd(self, cmd)
+        if rc != 0:
+            self.log_warning("Command failed '{}': {}".format(cmd, stderr))
+
+    def apply_all_port_lldp_status(self):
+        for port_name in self.lldp_port_table.getKeys():
+            _, fvp = self.lldp_port_table.get(port_name)
+            self.apply_port_lldp_status(port_name, dict(fvp) if fvp else {})
+
+    def lldp_process_lldp_port_event(self, op, port_name, fvp):
+        if op not in ["SET", "DEL"]:
+            return
+        if op == "DEL":
+            cfg = dict(self.lldp_global_cfg)
+        else:
+            cfg = dict(fvp) if fvp else {}
+        self.log_info("LLDP PORT Config Opcode: {} Port {} Dict {}".format(op, port_name, cfg))
+        self.apply_port_lldp_status(port_name, cfg)
+
+    def lldp_process_lldp_global_event(self, op, fvp):
+        if op not in ["SET", "DEL"]:
+            return
+        if op == "DEL":
+            cfg = {}
+        else:
+            cfg = dict(fvp) if fvp else {}
+        self.log_info("LLDP GLOBAL Config Opcode: {} Dict {}".format(op, cfg))
+        self.apply_global_lldp_config(cfg)
 
     def is_port_up(self, port_name):
         """
@@ -141,7 +324,7 @@ class LldpManager(daemon_base.DaemonBase):
         port_desc = None
 
         # Skip special (recirc/inband) and backplane interfaces as we don't enable lldp on those interfaaces.
-        if any([port_name.startswith(inband_prefix()),port_name.startswith(recirc_prefix()),port_name.startswith(backplane_prefix())]):
+        if is_lldp_skipped_port(port_name):
             return
  
         # Get the port alias. If None or empty string, use port name instead
@@ -228,6 +411,10 @@ class LldpManager(daemon_base.DaemonBase):
     def lldp_process_mgmt_info_change(self, op, mgmt_dict, key):
         if not op in ["SET", "DEL"]:
             return
+        if self.configured_management_interface():
+            self.log_info("Ignoring MGMT_INTERFACE change; management_interface is {}".format(
+                self.configured_management_interface()))
+            return
         self.log_info("Mgmt Config Opcode: {} Dict {} Key {} Curr {}".format(op, mgmt_dict, key, self.mgmt_ip))
         if '|' in key:
             key = key.split('|', 1)
@@ -309,6 +496,29 @@ class LldpManager(daemon_base.DaemonBase):
         sst_device_confdb = swsscommon.SubscriberStateTable(self.config_db, swsscommon.CFG_DEVICE_METADATA_TABLE_NAME)
         sel.addSelectable(sst_device_confdb)
 
+        # Subscribe to LLDP GLOBAL table notifications in the Config DB
+        sst_lldp_global_confdb = swsscommon.SubscriberStateTable(self.config_db, CFG_LLDP_TABLE_NAME)
+        sel.addSelectable(sst_lldp_global_confdb)
+
+        # Subscribe to LLDP_PORT table notifications in the Config DB
+        sst_lldp_port_confdb = swsscommon.SubscriberStateTable(self.config_db, CFG_LLDP_PORT_TABLE_NAME)
+        sel.addSelectable(sst_lldp_port_confdb)
+
+        # Subscribe to LLDP_CUSTOM_TLV table notifications in the Config DB
+        sst_lldp_custom_tlv_confdb = swsscommon.SubscriberStateTable(
+            self.config_db, CFG_LLDP_CUSTOM_TLV_TABLE_NAME)
+        sel.addSelectable(sst_lldp_custom_tlv_confdb)
+
+        # Apply boot-time LLDP|GLOBAL config before resuming lldpd
+        _, fvp = self.lldp_global_table.get(CFG_LLDP_GLOBAL_KEY)
+        self.apply_global_lldp_config(dict(fvp) if fvp else {})
+
+        # Apply boot-time LLDP_PORT config before resuming lldpd
+        self.apply_all_port_lldp_status()
+
+        # Apply advertised custom TLVs
+        self.apply_custom_tlv_config()
+
         # Listen for changes to the PORT table in the CONFIG_DB and APP_DB
         while True:
             (state, selectableObj) = sel.select(SELECT_TIMEOUT_MS, interrupt_on_signal=True)
@@ -320,6 +530,17 @@ class LldpManager(daemon_base.DaemonBase):
                 elif selectableObj.getFd() == sst_device_confdb.getFd():
                     (key, op, fvp) = sst_device_confdb.pop()
                     self.lldp_process_device_table_event(op, dict(fvp), key)
+                elif selectableObj.getFd() == sst_lldp_global_confdb.getFd():
+                    (key, op, fvp) = sst_lldp_global_confdb.pop()
+                    if key == CFG_LLDP_GLOBAL_KEY:
+                        self.lldp_process_lldp_global_event(op, fvp)
+                elif selectableObj.getFd() == sst_lldp_port_confdb.getFd():
+                    (key, op, fvp) = sst_lldp_port_confdb.pop()
+                    self.lldp_process_lldp_port_event(op, key, fvp)
+                elif selectableObj.getFd() == sst_lldp_custom_tlv_confdb.getFd():
+                    sst_lldp_custom_tlv_confdb.pop()
+                    self.log_info("LLDP_CUSTOM_TLV changed; rebuilding advertised TLVs")
+                    self.apply_custom_tlv_config()
                 elif selectableObj.getFd() == sst_appdb.getFd():
                     (key, op, fvp) = sst_appdb.pop()
                     self.lldp_process_port_table_event(key, op, fvp)

@@ -24,5 +24,12 @@
         "desc": "LLDP test port table with invalid mode",
         "eStrKey" : "InvalidValue",
         "eStr": ["mode"]
+    },
+    "LLDP_CUSTOM_TLV_TEST": {
+        "desc": "LLDP custom TLV advertisement table"
+    },
+    "LLDP_GLOBAL_TEST_INVALID_MGMT_IF": {
+        "desc": "LLDP test global table with invalid management interface",
+        "eStr": ["Invalid LLDP management interface name", "management_interface"]
     }
 }

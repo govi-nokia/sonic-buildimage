@@ -16,6 +16,12 @@ module sonic-lldp {
     description
         "SONiC LLDP yang model";
 
+    revision 2026-09-05 {
+        description
+            "Add global management_interface and LLDP_CUSTOM_TLV
+            advertisement table for OpenConfig LLDP 1.2.0.";
+    }
+
     revision 2021-07-08 {
         description
             "Initial revision.";
@@ -96,7 +102,72 @@ module sonic-lldp {
                         "Suppress sending of System Capabilities TLV in LLDP frames";
                 }
 
+                leaf management_interface {
+                    type string {
+                        length "1..32" {
+                            error-message "Invalid LLDP management interface name length.";
+                        }
+                        pattern '[A-Za-z][A-Za-z0-9._/-]*' {
+                            error-message "Invalid LLDP management interface name.";
+                            error-app-tag invalid-lldp-management-interface;
+                        }
+                    }
+                    description
+                        "Existing interface whose addresses populate the
+                        Management Address TLV (lldpcli 'configure system ip
+                        management pattern'). Wildcards are not allowed.
+                        When unset, lldpmgrd uses the first MGMT_INTERFACE
+                        address.";
+                }
+
                 uses lldp_mode_config;
+            }
+        }
+
+        container LLDP_CUSTOM_TLV {
+            description
+                "Globally advertised organizationally-specific LLDP TLVs.
+                Applied with 'lldpcli configure lldp custom-tlv'.";
+
+            list LLDP_CUSTOM_TLV_LIST {
+                key "name";
+
+                leaf name {
+                    type string {
+                        length "1..64";
+                    }
+                    description
+                        "Administrative name of the custom TLV (OpenConfig
+                        custom-tlvs list key). Not sent on the wire.";
+                }
+
+                leaf type {
+                    type uint8;
+                    default 127;
+                    description
+                        "LLDP TLV type. lldpd custom-tlv advertisement is
+                        organizationally specific (127).";
+                }
+
+                leaf oui {
+                    type string;
+                    mandatory true;
+                    description
+                        "Three-byte OUI, colon-separated hex (for example 00:90:69).";
+                }
+
+                leaf oui_subtype {
+                    type uint8;
+                    mandatory true;
+                    description
+                        "Organizationally defined subtype (0..255).";
+                }
+
+                leaf value {
+                    type string;
+                    description
+                        "TLV information string as hex digits (optional separators).";
+                }
             }
         }
 

@@ -10,7 +10,8 @@
                         "supp_mgmt_address_tlv": "true",
                         "supp_system_capabilities_tlv": "false",
                         "system_name": "sonic",
-                        "system_description": "sonic-system"
+                        "system_description": "sonic-system",
+                        "management_interface": "eth0"
                 }
             }
         }
@@ -158,6 +159,34 @@
                         "ifname": "Ethernet0",
                         "mode": "TRANSMITTING",
                         "enabled": "true"
+                    }
+                ]
+            }
+        }
+    },
+    "LLDP_GLOBAL_TEST_INVALID_MGMT_IF": {
+        "sonic-lldp:sonic-lldp": {
+            "sonic-lldp:LLDP": {
+                "sonic-lldp:GLOBAL": {
+                        "mode": "TRANSMIT",
+                        "enabled": "true",
+                        "hello_time": "20",
+                        "multiplier": "5",
+                        "management_interface": "?"
+                }
+            }
+        }
+    },
+    "LLDP_CUSTOM_TLV_TEST": {
+        "sonic-lldp:sonic-lldp": {
+            "sonic-lldp:LLDP_CUSTOM_TLV": {
+                "LLDP_CUSTOM_TLV_LIST": [
+                    {
+                        "name": "vendor-serial",
+                        "type": "127",
+                        "oui": "00:90:69",
+                        "oui_subtype": "1",
+                        "value": "435530323133353130363530"
                     }
                 ]
             }
